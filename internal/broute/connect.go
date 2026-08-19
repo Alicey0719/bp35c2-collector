@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math/bits"
 	"net"
 	"strconv"
 	"strings"
@@ -12,6 +13,8 @@ import (
 
 	"github.com/Alicey0719/bp35c2-collector/internal/bp35c2"
 )
+
+func popcount32(v uint32) int { return bits.OnesCount32(v) }
 
 // connectOnce performs the full SKSTACK-IP join sequence.
 //
@@ -33,14 +36,21 @@ func (m *Manager) connectOnce(ctx context.Context) (*Session, error) {
 	if err := m.simple(ctx, "SKRESET", 5*time.Second); err != nil {
 		return nil, fmt.Errorf("SKRESET: %w", err)
 	}
-	// Switch to hex-encoded ERXUDP data so the reader stays line-based.
-	// Some firmwares don't support these — best-effort only.
-	if err := m.simple(ctx, "WOPT 01", m.cfg.CommandTimeout); err != nil {
-		m.log.Debug("WOPT 01 not supported (continuing with default)", "err", err)
+	// Ask for hex-encoded ERXUDP so the line parser doesn't have to
+	// consume raw binary in the middle of a line. Some BP35C2
+	// firmwares silently accept but never OK — try with a short
+	// timeout and shrug if it doesn't answer, then rely on the fact
+	// that recent firmwares default to hex anyway.
+	shortCtx, shortCancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	if _, err := m.drv.Command(shortCtx, "WOPT 01"); err != nil {
+		m.log.Debug("WOPT 01 no ack (may be default)", "err", err)
 	}
-	if err := m.simple(ctx, "ROPT 01", m.cfg.CommandTimeout); err != nil {
-		m.log.Debug("ROPT 01 not supported (continuing with default)", "err", err)
+	shortCancel()
+	shortCtx, shortCancel = context.WithTimeout(ctx, 500*time.Millisecond)
+	if _, err := m.drv.Command(shortCtx, "ROPT 01"); err != nil {
+		m.log.Debug("ROPT 01 no ack (may be default)", "err", err)
 	}
+	shortCancel()
 	if err := m.simple(ctx, "SKSETPWD C "+m.cfg.BRoutePassword, m.cfg.CommandTimeout); err != nil {
 		return nil, fmt.Errorf("SKSETPWD: %w", err)
 	}
@@ -66,9 +76,9 @@ func (m *Manager) connectOnce(ctx context.Context) (*Session, error) {
 		return nil, fmt.Errorf("SKSREG S3: %w", err)
 	}
 
-	ipv6, err := m.macToIPv6(ctx, desc.Addr)
+	ipv6, err := macToLinkLocalIPv6(desc.Addr)
 	if err != nil {
-		return nil, fmt.Errorf("SKLL64: %w", err)
+		return nil, err
 	}
 
 	m.setState(StateJoining)
@@ -126,10 +136,14 @@ func (m *Manager) activeScan(ctx context.Context) (EPANDescriptor, error) {
 	}
 	cancel()
 
-	// Overall wait: 14 channels × 9.6ms × 2^N + generous slack.
-	scanBudget := time.Duration(14) * (10 * time.Millisecond) * (1 << m.cfg.ScanDuration)
-	if scanBudget < 5*time.Second {
-		scanBudget = 5 * time.Second
+	// Wait: (channels set in mask) × 9.6ms × 2^N + slack.
+	channels := popcount32(m.cfg.ChannelMask)
+	if channels == 0 {
+		channels = 32
+	}
+	scanBudget := time.Duration(channels) * (10 * time.Millisecond) * (1 << m.cfg.ScanDuration)
+	if scanBudget < 10*time.Second {
+		scanBudget = 10 * time.Second
 	}
 	scanBudget += 5 * time.Second
 
@@ -205,27 +219,6 @@ func parseEPANDESC(ev bp35c2.Event) (EPANDescriptor, error) {
 	}, nil
 }
 
-// macToIPv6 asks the module to convert the neighbour's MAC to its
-// link-local IPv6 (with the U/L bit flip handled by firmware).
-//
-// SKLL64 response is one line containing the IPv6 in canonical form.
-func (m *Manager) macToIPv6(ctx context.Context, addr string) (net.IP, error) {
-	cctx, cancel := context.WithTimeout(ctx, m.cfg.CommandTimeout)
-	defer cancel()
-	resp, err := m.drv.Command(cctx, "SKLL64 "+addr)
-	if err != nil {
-		return nil, err
-	}
-	if len(resp) == 0 {
-		return nil, errors.New("SKLL64: empty response")
-	}
-	ip := net.ParseIP(strings.TrimSpace(resp[0]))
-	if ip == nil {
-		return nil, fmt.Errorf("SKLL64: bad IP %q", resp[0])
-	}
-	return ip, nil
-}
-
 // doJoin sends SKJOIN and waits for the async EVENT 25 (success) or
 // EVENT 24 (failure). SKJOIN itself returns OK immediately; the join
 // outcome is separate.
@@ -241,7 +234,9 @@ func (m *Manager) doJoin(ctx context.Context, ip net.IP) error {
 	}()
 
 	cctx, cancel := context.WithTimeout(ctx, m.cfg.CommandTimeout)
-	if _, err := m.drv.Command(cctx, "SKJOIN "+ip.String()); err != nil {
+	// SKSTACK requires the fully-expanded upper-case form; the
+	// compressed lowercase output of net.IP.String() triggers FAIL ER06.
+	if _, err := m.drv.Command(cctx, "SKJOIN "+formatIPv6Upper(ip)); err != nil {
 		cancel()
 		return fmt.Errorf("SKJOIN: %w", err)
 	}

@@ -59,7 +59,10 @@ func (c *Client) Run(ctx context.Context) error {
 			}
 			f, err := echonet.Decode(in.Payload)
 			if err != nil {
-				c.log.Warn("failed to decode ECHONET Lite frame", "err", err)
+				// PANA handshake and Wi-SUN control traffic sometimes
+				// arrives on port 3610 without an ECHONET Lite header.
+				// It's normal, so log at debug only.
+				c.log.Debug("dropping non-ECHONET Lite UDP payload", "err", err, "len", len(in.Payload))
 				continue
 			}
 			c.pendMu.Lock()

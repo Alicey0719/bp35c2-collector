@@ -107,7 +107,7 @@ func TestConnectOnce_FullSequence(t *testing.T) {
 		afterOK: map[string]string{
 			"SKLL64 001D129012341234": "FE80:0000:0000:0000:021D:1290:1234:1234\r\n",
 			"SKSCAN 2 FFFFFFFF 6 0":   scanReply,
-			"SKJOIN fe80::21d:1290:1234:1234": "EVENT 25 FE80::1\r\n", // ideal case
+			"SKJOIN FE80:0000:0000:0000:021D:1290:1234:1234": "EVENT 25 FE80::1\r\n", // ideal case
 		},
 	}
 	go mm.run(t)
@@ -164,7 +164,7 @@ func TestConnectOnce_JoinFailureFromEVENT24(t *testing.T) {
 		afterOK: map[string]string{
 			"SKLL64 001D129012341234":          "FE80:0000:0000:0000:021D:1290:1234:1234\r\n",
 			"SKSCAN 2 FFFFFFFF 6 0":            scanReply,
-			"SKJOIN fe80::21d:1290:1234:1234":  "EVENT 24 FE80::1\r\n",
+			"SKJOIN FE80:0000:0000:0000:021D:1290:1234:1234":  "EVENT 24 FE80::1\r\n",
 		},
 	}
 	go mm.run(t)

@@ -316,6 +316,11 @@ func (m *Manager) handleEvent(ev bp35c2.Event) {
 		}
 		code := ev.Params[0]
 		switch code {
+		case "21":
+			// UDP send complete — the last param carries the send result
+			// (00=success, others=failure). We currently rely on
+			// SKSENDTO's OK/FAIL for the sync path, so this event is
+			// mostly informational.
 		case "22":
 			m.scanNotify(ev)
 		case "24":

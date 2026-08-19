@@ -139,6 +139,11 @@ func (d *Driver) Close() error {
 // Events exposes the async event channel.
 func (d *Driver) Events() <-chan Event { return d.events }
 
+// Done returns a channel that is closed when the driver has terminated
+// (Close called, or reader-loop failure). Callers use this to abort
+// long-running work when the underlying serial link is dead.
+func (d *Driver) Done() <-chan struct{} { return d.closed }
+
 // ReadError returns the last reader-goroutine error, or nil.
 func (d *Driver) ReadError() error {
 	d.readErrMu.Lock()
@@ -209,14 +214,7 @@ func (d *Driver) command(ctx context.Context, line string, payload []byte) ([]st
 }
 
 func (d *Driver) writeCommand(line string, payload []byte) error {
-	// For safety, redact credentials in debug logs.
-	logLine := line
-	switch {
-	case strings.HasPrefix(line, "SKSETPWD"):
-		logLine = "SKSETPWD ***"
-	case strings.HasPrefix(line, "SKSETRBID"):
-		logLine = "SKSETRBID ***"
-	}
+	logLine := redactCredential(line)
 	if len(payload) > 0 {
 		d.log.Debug("bp35c2 tx", "line", logLine, "payload_len", len(payload))
 	} else {
@@ -254,7 +252,7 @@ func (d *Driver) readLoop() {
 		if trimmed == "" {
 			continue
 		}
-		d.log.Debug("bp35c2 rx", "line", trimmed)
+		d.log.Debug("bp35c2 rx", "line", redactCredential(trimmed))
 		d.handleLine(trimmed)
 	}
 	if err := scanner.Err(); err != nil {
@@ -274,15 +272,18 @@ func (d *Driver) readLoop() {
 	}
 }
 
-// scanLinesCRLF splits on \n but keeps behaviour identical for lone
-// \n or \r\n (bufio's default already handles that). Kept as a named
-// function so tests can swap in easily.
+// scanLinesCRLF splits on either \r or \n. Some SKSTACK firmwares
+// terminate the command echo with a lone \r and the following response
+// with \r\n, so "OK\rSKINFO..." arrives as a single \n-terminated
+// chunk. Splitting on either character makes the parser robust to any
+// combination of \r, \n, and \r\n line endings. Empty tokens (from
+// consecutive separators) are surfaced and filtered by the caller.
 func scanLinesCRLF(data []byte, atEOF bool) (advance int, token []byte, err error) {
 	if atEOF && len(data) == 0 {
 		return 0, nil, nil
 	}
 	for i, b := range data {
-		if b == '\n' {
+		if b == '\r' || b == '\n' {
 			return i + 1, data[:i], nil
 		}
 	}
@@ -295,25 +296,21 @@ func scanLinesCRLF(data []byte, atEOF bool) (advance int, token []byte, err erro
 // handleLine routes one line to either the pending command or the
 // event channel.
 func (d *Driver) handleLine(line string) {
-	// EPANDESC is multi-line: header + 6 indented "Key:Value" rows.
-	// We accumulate here.
+	// EPANDESC is a multi-line block: an unindented "EPANDESC" header
+	// followed by any number of "  Key:Value" rows. The block is
+	// terminated by the first NON-indented line that follows (which is
+	// itself the next event / response). Firmware variants include
+	// different field sets (6 vs 7 rows), so we don't hard-code a
+	// count.
 	d.epMu.Lock()
 	if d.epanBuf != nil {
 		if strings.HasPrefix(line, " ") || strings.HasPrefix(line, "\t") {
 			d.epanBuf = append(d.epanBuf, line)
-			// EPANDESC has 6 fields; emit when we've got all 6 rows.
-			if len(d.epanBuf) >= 7 {
-				ev := buildEPANDESC(d.epanBuf)
-				d.epanBuf = nil
-				d.epMu.Unlock()
-				d.pushEvent(ev)
-				return
-			}
 			d.epMu.Unlock()
 			return
 		}
-		// Non-indented line ends the EPANDESC block early — emit whatever
-		// we have and fall through to process the new line.
+		// Non-indented line ends the EPANDESC block — emit and fall
+		// through to process this new line.
 		ev := buildEPANDESC(d.epanBuf)
 		d.epanBuf = nil
 		d.epMu.Unlock()
@@ -323,7 +320,10 @@ func (d *Driver) handleLine(line string) {
 	}
 
 	switch {
-	case line == "OK":
+	case line == "OK" || strings.HasPrefix(line, "OK "):
+		// Some SKSTACK commands (WOPT/ROPT/SKSREG) reply "OK <value>"
+		// where the trailing token is the current setting rather than a
+		// separate response line. Treat any "OK" or "OK …" as terminal.
 		d.completePending(true, "", nil)
 	case strings.HasPrefix(line, "FAIL "):
 		code := strings.TrimPrefix(line, "FAIL ")
@@ -355,7 +355,7 @@ func (d *Driver) handleLine(line string) {
 			d.pendMu.Unlock()
 			return
 		}
-		d.log.Debug("bp35c2: unattributed line", "line", line)
+		d.log.Debug("bp35c2: unattributed line", "line", redactCredential(line))
 	}
 }
 
@@ -446,3 +446,17 @@ func buildEPANDESC(lines []string) Event {
 
 // waitForEvent-style helpers are up on the manager, not the driver.
 // Consumers subscribe to Events() and filter themselves.
+
+// redactCredential replaces the secret half of SKSETPWD/SKSETRBID
+// lines with "***" for logging. The module echoes every command we
+// send back verbatim, so both TX and RX debug logs would leak the
+// Route-B ID and password without this scrub.
+func redactCredential(s string) string {
+	switch {
+	case strings.HasPrefix(s, "SKSETPWD "):
+		return "SKSETPWD ***"
+	case strings.HasPrefix(s, "SKSETRBID "):
+		return "SKSETRBID ***"
+	}
+	return s
+}

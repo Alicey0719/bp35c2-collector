@@ -200,6 +200,21 @@ func run() error {
 	watchdogCancel := startWatchdog(ctx, log)
 	defer watchdogCancel()
 
+	// If the driver's read loop dies (serial fd broken, USB unplug,
+	// scanner error) we can't recover in place — cancel the root
+	// context so every goroutine tears down and the process exits.
+	// systemd Restart=always brings us back with a fresh serial open.
+	go func() {
+		select {
+		case <-drv.Done():
+			if err := drv.ReadError(); err != nil {
+				log.Error("bp35c2 driver terminated — exiting for restart", "err", err)
+			}
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
 	// 8. Fan out goroutines.
 	errCh := make(chan error, 3)
 	go func() { errCh <- bmgr.Run(ctx) }()
@@ -240,8 +255,11 @@ func openSerial(device string, baud int) (bp35c2.ReadWriteCloser, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Read timeout keeps the reader goroutine responsive.
-	_ = port.SetReadTimeout(500 * time.Millisecond)
+	// Block Read until data arrives. A finite timeout produces
+	// (0, nil) returns that bufio.Scanner interprets as "reader
+	// broken", killing the driver mid-scan. Close of the underlying
+	// fd is what interrupts a blocked Read at shutdown.
+	_ = port.SetReadTimeout(serial.NoTimeout)
 	return port, nil
 }
 

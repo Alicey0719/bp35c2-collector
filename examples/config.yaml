@@ -15,10 +15,13 @@ broute:
   # Where to persist the last-successful Wi-SUN channel so restarts
   # can skip the ~8s active scan.
   state_dir: /var/lib/bp35c2-collector
-  # 6 → ~0.6s per channel × 14 channels ≈ 8.4s scan
+  # SKSCAN duration exponent (0..14). Real time per channel = ~9.6ms × 2^N.
+  # 6 → ~0.6s per channel.
   scan_time_exp: 6
-  # 0x0003FFF0 = channels 4..17
-  channel_mask: 262128
+  # SKSCAN channel bitmap. 4294967295 (0xFFFFFFFF) = scan every channel
+  # the firmware supports (recommended default for BP35C2). Narrow it
+  # only if you know exactly which channel your utility uses.
+  channel_mask: 4294967295
   pana_auth_timeout: 12m
   command_timeout: 6s
   initial_backoff: 5s

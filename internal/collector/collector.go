@@ -13,7 +13,6 @@ package collector
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -46,6 +45,12 @@ type Collector struct {
 	epcMap    map[byte]struct{}
 	haveOneShot bool
 
+	// unsupported EPCs discovered at runtime (PDC=0 in a Get response).
+	// Skipped from future batches so we don't spam warnings for props
+	// the meter never returns.
+	unsupportedMu sync.RWMutex
+	unsupported   map[byte]struct{}
+
 	// hooks
 	OnGetError    func(epc byte, err error)
 	OnGetSuccess  func()
@@ -73,15 +78,12 @@ func New(cli *meter.Client, s sink.Sink, cfg Config, log *slog.Logger) *Collecto
 
 // Run drives the polling loop until ctx expires.
 func (c *Collector) Run(ctx context.Context) error {
-	// One-shot: block briefly on probe. If the connection is not yet
-	// ready, WaitConnected inside Get will block until it is (or ctx
-	// expires).
-	if err := c.probeOnce(ctx); err != nil {
-		if errors.Is(err, context.Canceled) {
-			return err
-		}
-		c.log.Warn("initial meter probe failed; continuing with defaults", "err", err)
-	}
+	// Probe retries in the background: the meter isn't reachable until
+	// broute.Manager joins, and until we've read D3 (coefficient) and
+	// E1 (unit) the cumulative kWh values scale wrong. Never give up
+	// until ctx expires — a metered value that says "222355 kWh" is
+	// worse than "no value yet".
+	go c.probeUntilSuccess(ctx)
 
 	instant := time.NewTicker(c.cfg.InstantInterval)
 	cumulative := time.NewTicker(c.cfg.CumulativeInterval)
@@ -105,6 +107,29 @@ func (c *Collector) Run(ctx context.Context) error {
 		case <-scheduled.C:
 			c.collectScheduled(ctx)
 		}
+	}
+}
+
+// probeUntilSuccess keeps retrying the one-shot probe (property map +
+// coefficient + unit) until it succeeds or ctx is cancelled. Retries
+// use a fixed 15s gap so we don't spam the meter, but we never give up
+// — cumulative kWh values are meaningless without the unit byte.
+func (c *Collector) probeUntilSuccess(ctx context.Context) {
+	for attempt := 1; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return
+		}
+		if err := c.probeOnce(ctx); err != nil {
+			c.log.Warn("meter probe failed — retrying", "attempt", attempt, "err", err)
+			select {
+			case <-time.After(15 * time.Second):
+			case <-ctx.Done():
+				return
+			}
+			continue
+		}
+		c.log.Info("meter probe succeeded", "attempts", attempt)
+		return
 	}
 }
 
@@ -144,8 +169,15 @@ func (c *Collector) probeOnce(ctx context.Context) error {
 }
 
 // supports reports whether epc is in the meter's advertised Get map
-// (or if we never probed successfully, assume true).
+// AND is not on the runtime-discovered unsupported list.
 func (c *Collector) supports(epc byte) bool {
+	c.unsupportedMu.RLock()
+	if _, unsup := c.unsupported[epc]; unsup {
+		c.unsupportedMu.RUnlock()
+		return false
+	}
+	c.unsupportedMu.RUnlock()
+
 	c.oneShotMu.RLock()
 	defer c.oneShotMu.RUnlock()
 	if !c.haveOneShot || c.epcMap == nil {
@@ -153,6 +185,22 @@ func (c *Collector) supports(epc byte) bool {
 	}
 	_, ok := c.epcMap[epc]
 	return ok
+}
+
+// markUnsupported records an EPC as not implemented by this meter so
+// future collect batches skip it. Idempotent; logs only the first time.
+func (c *Collector) markUnsupported(epc byte, reason string) {
+	c.unsupportedMu.Lock()
+	defer c.unsupportedMu.Unlock()
+	if c.unsupported == nil {
+		c.unsupported = make(map[byte]struct{})
+	}
+	if _, seen := c.unsupported[epc]; seen {
+		return
+	}
+	c.unsupported[epc] = struct{}{}
+	c.log.Info("meter reports EPC unsupported — dropped from future polls",
+		"epc", fmt.Sprintf("%#x", epc), "reason", reason)
 }
 
 func (c *Collector) collectInstant(ctx context.Context) {
@@ -180,6 +228,10 @@ func (c *Collector) collectInstant(ctx context.Context) {
 	}
 	now := time.Now()
 	for _, p := range f.Props {
+		if len(p.EDT) == 0 {
+			c.markUnsupported(p.EPC, "PDC=0 in Get response")
+			continue
+		}
 		c.emitInstant(p, now)
 	}
 }
@@ -212,6 +264,10 @@ func (c *Collector) collectCumulative(ctx context.Context) {
 	coeff, unit := c.coeff, c.unitByte
 	c.oneShotMu.RUnlock()
 	for _, p := range f.Props {
+		if len(p.EDT) == 0 {
+			c.markUnsupported(p.EPC, "PDC=0 in Get response")
+			continue
+		}
 		c.emitCumulative(p, now, coeff, unit)
 	}
 }
@@ -243,6 +299,10 @@ func (c *Collector) collectScheduled(ctx context.Context) {
 	coeff, unit := c.coeff, c.unitByte
 	c.oneShotMu.RUnlock()
 	for _, p := range f.Props {
+		if len(p.EDT) == 0 {
+			c.markUnsupported(p.EPC, "PDC=0 in Get response")
+			continue
+		}
 		c.emitScheduled(p, coeff, unit)
 	}
 }

@@ -171,7 +171,12 @@ func TestEvents_EPANDESCMultiLine(t *testing.T) {
 			"  Pan ID:8888\r\n" +
 			"  Addr:001D129012341234\r\n" +
 			"  LQI:E1\r\n" +
-			"  PairID:12345678\r\n"))
+			"  Side:0\r\n" +
+			"  PairID:12345678\r\n" +
+			// A trailing non-indented line is required to terminate the
+			// EPANDESC block — real modules always send EVENT 20/22 or
+			// another EPANDESC next.
+			"EVENT 22 FE80::1 0\r\n"))
 	}()
 
 	select {
@@ -180,11 +185,22 @@ func TestEvents_EPANDESCMultiLine(t *testing.T) {
 			t.Fatalf("kind: %q", ev.Kind)
 		}
 		if ev.Fields["Channel"] != "21" || ev.Fields["Pan ID"] != "8888" ||
-			ev.Fields["Addr"] != "001D129012341234" {
+			ev.Fields["Addr"] != "001D129012341234" || ev.Fields["Side"] != "0" ||
+			ev.Fields["PairID"] != "12345678" {
 			t.Fatalf("fields: %+v", ev.Fields)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("EPANDESC not received")
+	}
+	// The trailing EVENT 22 that closed the EPANDESC block should also
+	// arrive as its own event.
+	select {
+	case ev := <-d.Events():
+		if ev.Kind != "EVENT" || len(ev.Params) < 1 || ev.Params[0] != "22" {
+			t.Fatalf("trailing event: %+v", ev)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("trailing EVENT 22 not received")
 	}
 }
 
@@ -220,11 +236,31 @@ func TestCommand_InterleavedEventGoesToChannel(t *testing.T) {
 	}
 }
 
-func TestCommand_CredentialsRedactedInLogs(t *testing.T) {
-	// Not user-facing behaviour, but a safety net: we don't emit the
-	// SKSETPWD/SKSETRBID contents in structured logs.
+func TestRedactCredential(t *testing.T) {
+	for _, tc := range []struct {
+		in, want string
+	}{
+		{"SKSETPWD C secret1234", "SKSETPWD ***"},
+		{"SKSETRBID 0123456789ABCDEF0123456789ABCDEF", "SKSETRBID ***"},
+		{"SKINFO", "SKINFO"},
+		{"EINFO FE80::1 001122 21 FFFF 0", "EINFO FE80::1 001122 21 FFFF 0"},
+		{"OK", "OK"},
+		{"", ""},
+	} {
+		if got := redactCredential(tc.in); got != tc.want {
+			t.Errorf("redactCredential(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestCommand_CredentialsRedactedInBothTXAndRXLogs(t *testing.T) {
+	// The wire actually carries the real credential (module echoes it
+	// back) — the redaction is only applied to structured logs. We
+	// verify both by capturing the log output.
 	host, module := newPair()
-	d := New(host, silentLogger(), 8)
+	var buf strings.Builder
+	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	d := New(host, log, 8)
 	defer d.Close()
 	go func() {
 		lr := &lineReader{}
@@ -233,7 +269,6 @@ func TestCommand_CredentialsRedactedInLogs(t *testing.T) {
 		if err != nil {
 			return
 		}
-		// Actual on-wire bytes still carry the real credential.
 		if !strings.HasPrefix(l, "SKSETPWD C ") {
 			t.Errorf("wire: %q", l)
 		}
@@ -243,6 +278,15 @@ func TestCommand_CredentialsRedactedInLogs(t *testing.T) {
 	defer cancel()
 	if _, err := d.Command(ctx, "SKSETPWD C secret1234"); err != nil {
 		t.Fatalf("Command: %v", err)
+	}
+	// Small wait so the RX log line is flushed too.
+	time.Sleep(30 * time.Millisecond)
+	out := buf.String()
+	if strings.Contains(out, "secret1234") {
+		t.Fatalf("log leaks credential:\n%s", out)
+	}
+	if !strings.Contains(out, "SKSETPWD ***") {
+		t.Fatalf("expected redacted marker; log:\n%s", out)
 	}
 }
 

@@ -1,23 +1,18 @@
-// Package broute drives the BP35C2 through the full B-route
-// connection lifecycle and hands ECHONET Lite payloads to higher
-// layers.
+// Package broute drives the SKSTACK-IP BP35C2 through the full
+// B-route connection lifecycle and hands ECHONET Lite payloads to
+// higher layers.
 //
 // The Manager runs a supervisor goroutine that:
 //
-//  1. Powers up the module and performs the init/PANA sequence
-//     (skipping active scan if we already know a good channel).
-//  2. Consumes async notifications from the driver: the ECHONET Lite
-//     data receive path (0x6018) is republished on Incoming(); link
-//     state changes (0x601A) and PANA re-auth failures (0x6028) drive
-//     the reconnection loop.
-//  3. On disconnect / auth-fail, tears down and reconnects with
-//     exponential backoff. After three consecutive MAC-join failures
-//     the cached channel is invalidated so the next attempt re-scans
-//     (handles a meter that moved bands).
+//  1. Resets the module and runs the join sequence (SKSETPWD +
+//     SKSETRBID, SKSCAN, SKSREG, SKLL64, SKJOIN).
+//  2. Consumes async events from the driver. ERXUDP flows out on
+//     Incoming(); EVENT 24/27/28/29 tear down and drive the
+//     reconnection loop.
+//  3. On disconnect / auth-fail, backs off exponentially and retries.
 //
 // Higher layers only interact with Session, obtained via
-// WaitConnected(); the Session guarantees SendUDP is only attempted
-// while the underlying link is up.
+// WaitConnected().
 package broute
 
 import (
@@ -39,20 +34,18 @@ type Config struct {
 	BRouteID string
 	// BRoutePassword is the 12-char Route-B password.
 	BRoutePassword string
-	// ChannelStorePath persists the last successful channel.
-	ChannelStorePath string
-	// ScanTimeExp: the S value passed to CmdActiveScan (0x01..0x0E).
-	// Real time per channel = 9.64ms * 2^S. Default 6 (~0.6s/ch).
-	ScanTimeExp byte
-	// ChannelMask: bitmap of channels to scan. Default 0x0003FFF0
-	// (channels 4..17).
+	// ScanDuration is the SKSCAN duration value (0..14). Real time per
+	// channel = 9.6 ms * 2^N. Default 6 (~0.6s/ch).
+	ScanDuration byte
+	// ChannelMask: bitmap of channels to scan. Default 0xFFFFFFFF
+	// (scan all).
 	ChannelMask uint32
-	// PANAAuthTimeout is how long we wait for the auth result
-	// notification after CmdBRoutePANAStart. Spec allows up to 706s
-	// on first pairing; give ourselves headroom.
-	PANAAuthTimeout time.Duration
-	// CommandTimeout applies to synchronous responses (initial
-	// settings, port open, etc). Default 6s per doc + 1s.
+	// JoinTimeout is how long to wait for EVENT 25/24 after SKJOIN.
+	// Spec allows several minutes on first pairing; give ourselves
+	// headroom. Default 3 min.
+	JoinTimeout time.Duration
+	// CommandTimeout applies to synchronous commands (SKSETPWD,
+	// SKSREG, etc.). Default 6s.
 	CommandTimeout time.Duration
 	// InitialBackoff / MaxBackoff bracket the reconnection back-off.
 	InitialBackoff time.Duration
@@ -64,7 +57,6 @@ type Incoming struct {
 	SrcIP   net.IP
 	SrcPort uint16
 	Payload []byte
-	RSSI    int8
 	At      time.Time
 }
 
@@ -73,24 +65,21 @@ type Session struct {
 	MeterIP  net.IP
 	PANID    uint16
 	Channel  byte
-	MeterMAC [8]byte
-	RSSI     int8
+	MeterMAC string // hex, 16 chars
 
 	mgr *Manager
 }
 
-// SendUDP sends payload to the meter over UDP port 3610. It blocks on
-// the module's CmdUDPSend response.
+// SendUDP sends payload to the meter over UDP port 3610.
 func (s *Session) SendUDP(ctx context.Context, payload []byte) error {
 	return s.mgr.sendUDP(ctx, s.MeterIP, payload)
 }
 
 // Manager owns the driver and drives the connection lifecycle.
 type Manager struct {
-	cfg   Config
-	drv   *bp35c2.Driver
-	log   *slog.Logger
-	store ChannelStore
+	cfg Config
+	drv *bp35c2.Driver
+	log *slog.Logger
 
 	state atomic.Int32 // holds a State
 
@@ -102,12 +91,16 @@ type Manager struct {
 	condMu      sync.Mutex
 	connectedCh chan struct{}
 
-	// panaResultCh is non-nil while the supervisor is blocking on
-	// the PANA authentication result. dispatchNotifications sends
-	// 0x6028 frames here when set; otherwise it treats them as an
-	// unsolicited auto-re-auth failure notification.
-	panaMu       sync.Mutex
-	panaResultCh chan bp35c2.Notification
+	// joinResultCh is non-nil while the supervisor is blocking on the
+	// EVENT 24/25 outcome after SKJOIN. dispatchEvents forwards those
+	// events here when set.
+	joinMu       sync.Mutex
+	joinResultCh chan bp35c2.Event
+
+	// scanResultCh is non-nil while an active scan is running.
+	// dispatchEvents forwards EPANDESC and EVENT 22 here when set.
+	scanMu       sync.Mutex
+	scanResultCh chan bp35c2.Event
 
 	// disc receives the reason the current connection died.
 	discMu sync.Mutex
@@ -118,20 +111,19 @@ type Manager struct {
 	OnStateChange func(State)
 }
 
-// NewManager constructs a Manager. The caller retains ownership of drv
-// and is responsible for closing it after Manager.Run returns.
+// NewManager constructs a Manager. The caller retains ownership of drv.
 func NewManager(drv *bp35c2.Driver, cfg Config, log *slog.Logger) *Manager {
 	if log == nil {
 		log = slog.Default()
 	}
-	if cfg.ScanTimeExp == 0 {
-		cfg.ScanTimeExp = 6
+	if cfg.ScanDuration == 0 {
+		cfg.ScanDuration = 6
 	}
 	if cfg.ChannelMask == 0 {
-		cfg.ChannelMask = 0x0003FFF0
+		cfg.ChannelMask = 0xFFFFFFFF
 	}
-	if cfg.PANAAuthTimeout == 0 {
-		cfg.PANAAuthTimeout = 720 * time.Second
+	if cfg.JoinTimeout == 0 {
+		cfg.JoinTimeout = 3 * time.Minute
 	}
 	if cfg.CommandTimeout == 0 {
 		cfg.CommandTimeout = 6 * time.Second
@@ -146,7 +138,6 @@ func NewManager(drv *bp35c2.Driver, cfg Config, log *slog.Logger) *Manager {
 		cfg:         cfg,
 		drv:         drv,
 		log:         log.With("component", "broute"),
-		store:       ChannelStore{Path: cfg.ChannelStorePath},
 		incoming:    make(chan Incoming, 32),
 		connectedCh: make(chan struct{}),
 	}
@@ -180,29 +171,19 @@ func (m *Manager) WaitConnected(ctx context.Context) (*Session, error) {
 	}
 }
 
-// Run supervises the connection until ctx is cancelled. Returns when
-// ctx is done.
+// Run supervises the connection until ctx is cancelled.
 func (m *Manager) Run(ctx context.Context) error {
-	go m.dispatchNotifications(ctx)
+	go m.dispatchEvents(ctx)
 
 	backoff := m.cfg.InitialBackoff
-	consecJoinFailures := 0
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		m.setState(StateInitializing)
-		sess, joinErr, err := m.connectOnce(ctx)
+		sess, err := m.connectOnce(ctx)
 		if err != nil {
 			m.log.Error("broute connect failed", "err", err, "backoff", backoff.String())
-			if joinErr {
-				consecJoinFailures++
-				if consecJoinFailures >= 3 {
-					m.log.Warn("clearing cached channel after repeated join failures")
-					_ = m.store.Clear()
-					consecJoinFailures = 0
-				}
-			}
 			if m.OnReconnect != nil {
 				m.OnReconnect()
 			}
@@ -214,15 +195,13 @@ func (m *Manager) Run(ctx context.Context) error {
 			backoff = nextBackoff(backoff, m.cfg.MaxBackoff)
 			continue
 		}
-		consecJoinFailures = 0
 		backoff = m.cfg.InitialBackoff
 		m.installSession(sess)
 		m.setState(StateConnected)
 		m.log.Info("broute connected",
 			"meter_ip", sess.MeterIP.String(),
 			"channel", sess.Channel,
-			"pan_id", fmt.Sprintf("%#04x", sess.PANID),
-			"rssi_dbm", sess.RSSI)
+			"pan_id", fmt.Sprintf("%#04x", sess.PANID))
 
 		reason := m.waitForDisconnect(ctx)
 		m.clearSession()
@@ -275,13 +254,11 @@ func (m *Manager) waitForDisconnect(ctx context.Context) error {
 	m.disc = make(chan error, 1)
 	ch := m.disc
 	m.discMu.Unlock()
-
 	defer func() {
 		m.discMu.Lock()
 		m.disc = nil
 		m.discMu.Unlock()
 	}()
-
 	select {
 	case err := <-ch:
 		return err
@@ -303,28 +280,27 @@ func (m *Manager) notifyDisconnect(err error) {
 	}
 }
 
-// dispatchNotifications is the sole consumer of drv.Notifications().
-func (m *Manager) dispatchNotifications(ctx context.Context) {
+// dispatchEvents is the sole consumer of drv.Events().
+func (m *Manager) dispatchEvents(ctx context.Context) {
 	for {
 		select {
-		case n, ok := <-m.drv.Notifications():
+		case ev, ok := <-m.drv.Events():
 			if !ok {
-				m.notifyDisconnect(errors.New("driver notifications channel closed"))
+				m.notifyDisconnect(errors.New("driver events channel closed"))
 				return
 			}
-			m.handleNotification(n)
+			m.handleEvent(ev)
 		case <-ctx.Done():
 			return
 		}
 	}
 }
 
-func (m *Manager) handleNotification(n bp35c2.Notification) {
-	switch n.Command {
-	case bp35c2.NotifyUDPReceive:
-		inc, err := parseUDPReceive(n.Data)
-		if err != nil {
-			m.log.Warn("bad 0x6018 payload", "err", err)
+func (m *Manager) handleEvent(ev bp35c2.Event) {
+	switch ev.Kind {
+	case "ERXUDP":
+		inc, ok := parseIncoming(ev)
+		if !ok {
 			return
 		}
 		select {
@@ -332,46 +308,73 @@ func (m *Manager) handleNotification(n bp35c2.Notification) {
 		default:
 			m.log.Warn("incoming channel full — dropping ECHONET Lite frame")
 		}
-	case bp35c2.NotifyPANAResult:
-		m.panaMu.Lock()
-		ch := m.panaResultCh
-		m.panaMu.Unlock()
-		if ch != nil {
-			select {
-			case ch <- n:
-			default:
-			}
+	case "EPANDESC":
+		m.scanNotify(ev)
+	case "EVENT":
+		if len(ev.Params) < 1 {
 			return
 		}
-		if len(n.Data) < 1 || n.Data[0] != 0x01 {
-			m.log.Warn("PANA auto re-auth failed", "result", fmt.Sprintf("%#x", firstByte(n.Data)))
+		code := ev.Params[0]
+		switch code {
+		case "22":
+			m.scanNotify(ev)
+		case "24":
+			m.joinNotify(ev)
 			if m.OnAuthFailure != nil {
 				m.OnAuthFailure()
 			}
-			m.notifyDisconnect(errors.New("PANA re-authentication failed"))
-		}
-	case bp35c2.NotifyLinkStateChg:
-		if len(n.Data) < 1 {
-			return
-		}
-		switch n.Data[0] {
-		case 0x03:
-			m.notifyDisconnect(errors.New("MAC link lost"))
-		case 0x04:
-			m.notifyDisconnect(errors.New("PANA link lost"))
+			m.notifyDisconnect(errors.New("PANA connection failed (EVENT 24)"))
+		case "25":
+			m.joinNotify(ev)
+		case "26":
+			m.log.Info("PANA session lifetime — module will re-authenticate")
+		case "27", "28", "29":
+			m.notifyDisconnect(fmt.Errorf("PANA session terminated (EVENT %s)", code))
+		case "32":
+			m.log.Warn("ARIB transmit rate limit reached (EVENT 32)")
+		case "33":
+			m.log.Info("ARIB transmit rate limit lifted (EVENT 33)")
 		default:
-			m.log.Debug("link state change", "state", fmt.Sprintf("%#x", n.Data[0]))
+			m.log.Debug("unhandled EVENT", "code", code)
 		}
-	case bp35c2.NotifyBoot:
-		m.log.Info("module boot notification received")
-	default:
-		m.log.Debug("unhandled notification", "cmd", fmt.Sprintf("%#04x", n.Command))
 	}
 }
 
-func firstByte(b []byte) byte {
-	if len(b) == 0 {
-		return 0
+// scanNotify forwards EPANDESC / EVENT 22 events to an in-progress
+// activeScan. Blocks briefly if the channel is momentarily full
+// (buffered) rather than dropping — scan results are precious.
+func (m *Manager) scanNotify(ev bp35c2.Event) {
+	m.scanMu.Lock()
+	ch := m.scanResultCh
+	m.scanMu.Unlock()
+	if ch == nil {
+		return
 	}
-	return b[0]
+	select {
+	case ch <- ev:
+	default:
+		// Full — allow a short blocking wait so we don't lose EPANDESCs
+		// during a burst.
+		select {
+		case ch <- ev:
+		case <-time.After(50 * time.Millisecond):
+			m.log.Warn("dropped scan event under back-pressure", "kind", ev.Kind)
+		}
+	}
+}
+
+// joinNotify forwards EVENT 24/25 to the connectOnce loop if it's
+// currently waiting for the join outcome. Otherwise the event is
+// swallowed (already have a session or the join path timed out).
+func (m *Manager) joinNotify(ev bp35c2.Event) {
+	m.joinMu.Lock()
+	ch := m.joinResultCh
+	m.joinMu.Unlock()
+	if ch == nil {
+		return
+	}
+	select {
+	case ch <- ev:
+	default:
+	}
 }

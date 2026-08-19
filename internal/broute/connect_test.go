@@ -2,15 +2,14 @@ package broute
 
 import (
 	"context"
-	"encoding/binary"
 	"io"
 	"log/slog"
-	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/Alicey0719/bp35c2-collector/internal/bp35c2"
-	"github.com/Alicey0719/bp35c2-collector/internal/frame"
 )
 
 type pipeConn struct {
@@ -31,182 +30,196 @@ func newPair() (host, module pipeConn) {
 	return pipeConn{r: hostR, w: hostW}, pipeConn{r: moduleR, w: moduleW}
 }
 
-func encResp(cmd uint16, data []byte) []byte {
-	b, err := frame.Encode(frame.Frame{Direction: frame.DirectionResponse, Command: cmd, Data: data})
-	if err != nil {
-		panic(err)
-	}
-	return b
-}
-
 func silentLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-// TestConnectOnce_CachedChannel exercises the connect path where a
-// cached channel is present, so no active scan is performed.
-func TestConnectOnce_CachedChannel(t *testing.T) {
-	dir := t.TempDir()
-	chPath := filepath.Join(dir, "channel")
-	// Seed the cache with channel 0x0C.
-	if err := (ChannelStore{Path: chPath}).Save(0x0C); err != nil {
-		t.Fatal(err)
-	}
+// mockModule speaks the SKSTACK-IP subset needed for a full connect.
+// It is driven by scripting from the test: each incoming line is
+// matched by prefix, and a fixed reply script is emitted.
+type mockModule struct {
+	side pipeConn
+	log  *slog.Logger
+	// Post-command scripted replies to inject after ACK. Sent as raw
+	// strings so tests can include CRLF and multi-line blobs.
+	afterOK map[string]string
+}
 
-	hostSide, moduleSide := newPair()
-	drv := bp35c2.New(hostSide, silentLogger(), 8)
-	defer drv.Close()
-
-	// Scripted module: replies to CmdBRouteAuthSet → CmdInitialSettings →
-	// CmdBRouteStart → CmdUDPPortOpen → CmdBRoutePANAStart, then sends
-	// the 0x6028 PANA success notification.
-	moduleDone := make(chan error, 1)
-	go func() {
-		defer close(moduleDone)
-		r := frame.NewReader(moduleSide)
-		expect := []uint16{
-			bp35c2.CmdBRouteAuthSet,
-			bp35c2.CmdInitialSettings,
-			bp35c2.CmdBRouteStart,
-			bp35c2.CmdUDPPortOpen,
-			bp35c2.CmdBRoutePANAStart,
+func (mm *mockModule) run(t *testing.T) {
+	buf := make([]byte, 4096)
+	var acc []byte
+	handleLine := func(line string) {
+		// Echo, then optional canned reply, then OK.
+		reply := "OK\r\n"
+		if extra, ok := mm.afterOK[line]; ok {
+			reply = extra + "OK\r\n"
 		}
-		for _, wantCmd := range expect {
-			f, err := r.Read()
-			if err != nil {
-				moduleDone <- err
-				return
-			}
-			if f.Command != wantCmd {
-				t.Errorf("module: got cmd %#x, want %#x", f.Command, wantCmd)
-				return
-			}
-			var respData []byte
-			switch wantCmd {
-			case bp35c2.CmdBRouteStart:
-				// [respResult=0x01][channel=0x0C][panID=0xABCD][mac 8B][rssi=0xC0]
-				respData = append(respData, 0x01, 0x0C)
-				respData = binary.BigEndian.AppendUint16(respData, 0xABCD)
-				respData = append(respData, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88)
-				respData = append(respData, 0xC0)
-			default:
-				respData = []byte{0x01}
-			}
-			if _, err := moduleSide.Write(encResp(wantCmd|0x2000, respData)); err != nil {
-				moduleDone <- err
-				return
-			}
-			// After acknowledging PANA start, deliver the async result.
-			if wantCmd == bp35c2.CmdBRoutePANAStart {
-				time.Sleep(10 * time.Millisecond)
-				payload := append([]byte{0x01}, []byte{0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88}...)
-				if _, err := moduleSide.Write(encResp(bp35c2.NotifyPANAResult, payload)); err != nil {
-					moduleDone <- err
-					return
-				}
-			}
+		// Some commands like SKSCAN emit their result asynchronously via
+		// EVENT — the reply script for those handles it.
+		switch {
+		case strings.HasPrefix(line, "SKSCAN "):
+			// OK immediately, then scripted async block (EPANDESC + EVENT 22).
+			mm.side.Write([]byte(line + "\r\n" + reply))
+			return
+		case strings.HasPrefix(line, "SKJOIN "):
+			mm.side.Write([]byte(line + "\r\n" + reply))
+			return
 		}
-	}()
-
-	mgr := NewManager(drv, Config{
-		BRouteID:         "0123456789ABCDEF0123456789ABCDEF",
-		BRoutePassword:   "PASSWORD1234",
-		ChannelStorePath: chPath,
-		CommandTimeout:   1 * time.Second,
-		PANAAuthTimeout:  1 * time.Second,
-	}, silentLogger())
-
-	// dispatchNotifications must be running for PANA result to reach doPANA.
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	go mgr.dispatchNotifications(ctx)
-
-	sess, joinErr, err := mgr.connectOnce(ctx)
-	if err != nil {
-		t.Fatalf("connectOnce: %v (joinErr=%v)", err, joinErr)
+		mm.side.Write([]byte(line + "\r\n" + reply))
 	}
-	if sess.Channel != 0x0C {
-		t.Fatalf("channel: %#x", sess.Channel)
-	}
-	if sess.PANID != 0xABCD {
-		t.Fatalf("pan: %#x", sess.PANID)
-	}
-	wantMAC := [8]byte{0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88}
-	if sess.MeterMAC != wantMAC {
-		t.Fatalf("mac: %x", sess.MeterMAC)
-	}
-	// Link-local IP: fe80::1322:3344:5566:7788 (first byte 11 XOR 02 = 13)
-	if sess.MeterIP.String() != "fe80::1322:3344:5566:7788" {
-		t.Fatalf("ip: %s", sess.MeterIP)
-	}
-	if err := <-moduleDone; err != nil {
-		t.Fatalf("module: %v", err)
+	for {
+		n, err := mm.side.Read(buf)
+		if err != nil {
+			return
+		}
+		acc = append(acc, buf[:n]...)
+		for {
+			idx := strings.Index(string(acc), "\r\n")
+			if idx < 0 {
+				break
+			}
+			line := string(acc[:idx])
+			acc = acc[idx+2:]
+			handleLine(line)
+		}
 	}
 }
 
-// TestConnectOnce_PANAAuthFailure verifies that a 0x6028 result != 0x01
-// propagates as an error from connectOnce.
-func TestConnectOnce_PANAAuthFailure(t *testing.T) {
-	dir := t.TempDir()
-	chPath := filepath.Join(dir, "channel")
-	_ = (ChannelStore{Path: chPath}).Save(0x0C)
-
-	hostSide, moduleSide := newPair()
-	drv := bp35c2.New(hostSide, silentLogger(), 8)
+func TestConnectOnce_FullSequence(t *testing.T) {
+	host, module := newPair()
+	drv := bp35c2.New(host, silentLogger(), 32)
 	defer drv.Close()
 
-	go func() {
-		r := frame.NewReader(moduleSide)
-		expect := []uint16{
-			bp35c2.CmdBRouteAuthSet,
-			bp35c2.CmdInitialSettings,
-			bp35c2.CmdBRouteStart,
-			bp35c2.CmdUDPPortOpen,
-			bp35c2.CmdBRoutePANAStart,
-		}
-		for _, wantCmd := range expect {
-			f, err := r.Read()
-			if err != nil {
-				return
-			}
-			if f.Command != wantCmd {
-				t.Errorf("module: got cmd %#x, want %#x", f.Command, wantCmd)
-				return
-			}
-			var respData []byte
-			switch wantCmd {
-			case bp35c2.CmdBRouteStart:
-				respData = append(respData, 0x01, 0x0C)
-				respData = binary.BigEndian.AppendUint16(respData, 0xABCD)
-				respData = append(respData, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88)
-				respData = append(respData, 0xC0)
-			default:
-				respData = []byte{0x01}
-			}
-			_, _ = moduleSide.Write(encResp(wantCmd|0x2000, respData))
-			if wantCmd == bp35c2.CmdBRoutePANAStart {
-				time.Sleep(10 * time.Millisecond)
-				// result 0x02 = auth failure
-				payload := append([]byte{0x02}, []byte{0, 0, 0, 0, 0, 0, 0, 0}...)
-				_, _ = moduleSide.Write(encResp(bp35c2.NotifyPANAResult, payload))
-			}
-		}
-	}()
+	// EPANDESC block + EVENT 22 to emit right after SKSCAN OK.
+	scanReply := "" +
+		"EPANDESC\r\n" +
+		"  Channel:21\r\n" +
+		"  Channel Page:09\r\n" +
+		"  Pan ID:8888\r\n" +
+		"  Addr:001D129012341234\r\n" +
+		"  LQI:E1\r\n" +
+		"  PairID:12345678\r\n" +
+		"EVENT 22 FE80:0000:0000:0000:021D:1291:0002:0129\r\n"
+
+	mm := &mockModule{
+		side: module,
+		log:  silentLogger(),
+		afterOK: map[string]string{
+			"SKLL64 001D129012341234": "FE80:0000:0000:0000:021D:1290:1234:1234\r\n",
+			"SKSCAN 2 FFFFFFFF 6 0":   scanReply,
+			"SKJOIN fe80::21d:1290:1234:1234": "EVENT 25 FE80::1\r\n", // ideal case
+		},
+	}
+	go mm.run(t)
 
 	mgr := NewManager(drv, Config{
-		BRouteID:         "0123456789ABCDEF0123456789ABCDEF",
-		BRoutePassword:   "PASSWORD1234",
-		ChannelStorePath: chPath,
-		CommandTimeout:   1 * time.Second,
-		PANAAuthTimeout:  1 * time.Second,
+		BRouteID:       "0123456789ABCDEF0123456789ABCDEF",
+		BRoutePassword: "PASSWORD1234",
+		ScanDuration:   6,
+		ChannelMask:    0xFFFFFFFF,
+		CommandTimeout: 2 * time.Second,
+		JoinTimeout:    2 * time.Second,
 	}, silentLogger())
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	go mgr.dispatchNotifications(ctx)
+	go mgr.dispatchEvents(ctx)
 
-	_, _, err := mgr.connectOnce(ctx)
+	sess, err := mgr.connectOnce(ctx)
+	if err != nil {
+		t.Fatalf("connectOnce: %v", err)
+	}
+	if sess.Channel != 0x21 {
+		t.Fatalf("channel: %#x", sess.Channel)
+	}
+	if sess.PANID != 0x8888 {
+		t.Fatalf("panid: %#x", sess.PANID)
+	}
+	if sess.MeterMAC != "001D129012341234" {
+		t.Fatalf("mac: %q", sess.MeterMAC)
+	}
+	if sess.MeterIP.String() != "fe80::21d:1290:1234:1234" {
+		t.Fatalf("ip: %s", sess.MeterIP)
+	}
+}
+
+func TestConnectOnce_JoinFailureFromEVENT24(t *testing.T) {
+	host, module := newPair()
+	drv := bp35c2.New(host, silentLogger(), 32)
+	defer drv.Close()
+
+	scanReply := "" +
+		"EPANDESC\r\n" +
+		"  Channel:21\r\n" +
+		"  Channel Page:09\r\n" +
+		"  Pan ID:8888\r\n" +
+		"  Addr:001D129012341234\r\n" +
+		"  LQI:E1\r\n" +
+		"  PairID:12345678\r\n" +
+		"EVENT 22 FE80::1\r\n"
+
+	mm := &mockModule{
+		side: module,
+		log:  silentLogger(),
+		afterOK: map[string]string{
+			"SKLL64 001D129012341234":          "FE80:0000:0000:0000:021D:1290:1234:1234\r\n",
+			"SKSCAN 2 FFFFFFFF 6 0":            scanReply,
+			"SKJOIN fe80::21d:1290:1234:1234":  "EVENT 24 FE80::1\r\n",
+		},
+	}
+	go mm.run(t)
+
+	var authFails int32
+	var mu sync.Mutex
+	mgr := NewManager(drv, Config{
+		BRouteID:       "0123456789ABCDEF0123456789ABCDEF",
+		BRoutePassword: "PASSWORD1234",
+		ScanDuration:   6,
+		ChannelMask:    0xFFFFFFFF,
+		CommandTimeout: 2 * time.Second,
+		JoinTimeout:    2 * time.Second,
+	}, silentLogger())
+	mgr.OnAuthFailure = func() {
+		mu.Lock()
+		authFails++
+		mu.Unlock()
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go mgr.dispatchEvents(ctx)
+
+	_, err := mgr.connectOnce(ctx)
 	if err == nil {
 		t.Fatal("expected auth failure")
+	}
+	// AllowOnAuthFailure to fire async
+	time.Sleep(50 * time.Millisecond)
+	mu.Lock()
+	got := authFails
+	mu.Unlock()
+	if got == 0 {
+		t.Fatal("OnAuthFailure not fired")
+	}
+}
+
+func TestParseEPANDESC(t *testing.T) {
+	ev := bp35c2.Event{
+		Kind: "EPANDESC",
+		Fields: map[string]string{
+			"Channel":      "21",
+			"Channel Page": "09",
+			"Pan ID":       "8888",
+			"Addr":         "001D129012341234",
+			"LQI":          "E1",
+			"PairID":       "12345678",
+		},
+	}
+	d, err := parseEPANDESC(ev)
+	if err != nil {
+		t.Fatalf("parseEPANDESC: %v", err)
+	}
+	if d.Channel != 0x21 || d.PANID != 0x8888 || d.LQI != 0xE1 {
+		t.Fatalf("bad parse: %+v", d)
 	}
 }

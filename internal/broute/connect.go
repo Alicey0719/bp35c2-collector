@@ -2,258 +2,260 @@ package broute
 
 import (
 	"context"
-	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
-	"os"
+	"net"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Alicey0719/bp35c2-collector/internal/bp35c2"
 )
 
-// connectOnce performs the full connect sequence once. On success it
-// returns a live Session. joinErr is true when the failure looked like
-// a MAC-level join problem (bad channel, meter unreachable) — the
-// supervisor uses it to invalidate the cached channel after repeated
-// failures.
-func (m *Manager) connectOnce(ctx context.Context) (*Session, bool, error) {
-	// 1. Ensure module is in known state. Hardware reset is
-	//    intentionally NOT sent every attempt — it clobbers any
-	//    other in-progress state and forces a full re-init. On the
-	//    very first attempt after boot, most modules deliver the
-	//    boot notification (0x6019) unsolicited; we don't block on
-	//    it (it may have already been consumed by another
-	//    reconnect cycle). Instead we rely on responses to actual
-	//    commands to prove the module is alive.
-
-	channel, err := m.pickInitialChannel(ctx)
-	if err != nil {
-		return nil, false, err
+// connectOnce performs the full SKSTACK-IP join sequence.
+//
+// Sequence (per ROHM SKSTACK-IP application note):
+//
+//	SKRESET                              // clean state
+//	ROPT 01 / WOPT 01                    // ERXUDP hex mode (best-effort)
+//	SKSETPWD C <pass>                    // Route-B password
+//	SKSETRBID <id>                       // Route-B ID
+//	SKSCAN 2 <mask> <dur> 0              // scan; collect EPANDESC, EVENT 22
+//	SKSREG S2 <ch>                       // set channel
+//	SKSREG S3 <panid>                    // set PAN ID
+//	SKLL64 <mac>                         // MAC → IPv6 (handles U/L flip)
+//	SKJOIN <ipv6>                        // PANA; wait EVENT 25 or 24
+func (m *Manager) connectOnce(ctx context.Context) (*Session, error) {
+	m.setState(StateInitializing)
+	// SKRESET has no OK — it just replies with OK. Some firmwares also
+	// emit a boot notice first. Give it a slightly larger timeout.
+	if err := m.simple(ctx, "SKRESET", 5*time.Second); err != nil {
+		return nil, fmt.Errorf("SKRESET: %w", err)
+	}
+	// Switch to hex-encoded ERXUDP data so the reader stays line-based.
+	// Some firmwares don't support these — best-effort only.
+	if err := m.simple(ctx, "WOPT 01", m.cfg.CommandTimeout); err != nil {
+		m.log.Debug("WOPT 01 not supported (continuing with default)", "err", err)
+	}
+	if err := m.simple(ctx, "ROPT 01", m.cfg.CommandTimeout); err != nil {
+		m.log.Debug("ROPT 01 not supported (continuing with default)", "err", err)
+	}
+	if err := m.simple(ctx, "SKSETPWD C "+m.cfg.BRoutePassword, m.cfg.CommandTimeout); err != nil {
+		return nil, fmt.Errorf("SKSETPWD: %w", err)
+	}
+	if err := m.simple(ctx, "SKSETRBID "+m.cfg.BRouteID, m.cfg.CommandTimeout); err != nil {
+		return nil, fmt.Errorf("SKSETRBID: %w", err)
 	}
 
-	// 2. Push Route-B credentials (always: module is stateless).
-	if err := m.setBRouteAuth(ctx); err != nil {
-		return nil, false, err
-	}
-
-	// 3. Re-run initial settings with the confirmed channel.
-	if err := m.setInitialSettings(ctx, channel); err != nil {
-		return nil, false, err
-	}
-
-	// 4. Start B-route → meter MAC / PAN ID.
-	m.setState(StateJoining)
-	sess, err := m.startBRoute(ctx, channel)
-	if err != nil {
-		return nil, true, err // treat as join failure
-	}
-
-	// 5. Open UDP port 3610.
-	if err := m.openUDPPort(ctx); err != nil {
-		return nil, false, err
-	}
-
-	// 6. Kick off PANA and wait for the result notification.
-	if err := m.doPANA(ctx); err != nil {
-		return nil, false, err
-	}
-
-	// 7. Persist the channel we actually got connected on.
-	if err := m.store.Save(channel); err != nil {
-		m.log.Warn("failed to persist channel", "err", err)
-	}
-	sess.mgr = m
-	return sess, false, nil
-}
-
-func (m *Manager) pickInitialChannel(ctx context.Context) (byte, error) {
-	if ch, err := m.store.Load(); err == nil {
-		m.log.Info("using cached channel from previous session", "channel", ch)
-		return ch, nil
-	} else if !errors.Is(err, os.ErrNotExist) {
-		m.log.Warn("failed to load cached channel — falling back to scan", "err", err)
-	}
 	m.setState(StateScanning)
-
-	// Initial settings before scanning need Dual mode set.
-	if err := m.setInitialSettings(ctx, 0x04); err != nil {
-		return 0, fmt.Errorf("pre-scan initial settings: %w", err)
-	}
-	if err := m.setBRouteAuth(ctx); err != nil {
-		return 0, fmt.Errorf("pre-scan auth setup: %w", err)
-	}
-	ch, err := m.activeScan(ctx)
+	desc, err := m.activeScan(ctx)
 	if err != nil {
-		return 0, err
+		return nil, fmt.Errorf("scan: %w", err)
 	}
-	m.log.Info("active scan chose channel", "channel", ch)
-	return ch, nil
-}
+	m.log.Info("meter found",
+		"channel", desc.Channel,
+		"pan_id", fmt.Sprintf("%#04x", desc.PANID),
+		"addr", desc.Addr,
+		"lqi", desc.LQI)
 
-func (m *Manager) setInitialSettings(ctx context.Context, channel byte) error {
-	// CmdInitialSettings request: [mode 1B][sleep 1B][ch 1B][tx 1B]
-	// mode 0x05 = Dual (required for B-route)
-	data := []byte{0x05, 0x00, channel, 0x00}
-	cctx, cancel := context.WithTimeout(ctx, m.cfg.CommandTimeout)
-	defer cancel()
-	_, err := m.drv.Request(cctx, bp35c2.CmdInitialSettings, data)
-	return err
-}
-
-func (m *Manager) setBRouteAuth(ctx context.Context) error {
-	// CmdBRouteAuthSet: [id 32B ASCII HEX][pass 12B ASCII]
-	if len(m.cfg.BRouteID) != 32 {
-		return fmt.Errorf("BRouteID must be 32 chars (got %d)", len(m.cfg.BRouteID))
+	if err := m.simple(ctx, fmt.Sprintf("SKSREG S2 %02X", desc.Channel), m.cfg.CommandTimeout); err != nil {
+		return nil, fmt.Errorf("SKSREG S2: %w", err)
 	}
-	if len(m.cfg.BRoutePassword) != 12 {
-		return fmt.Errorf("BRoutePassword must be 12 chars (got %d)", len(m.cfg.BRoutePassword))
-	}
-	data := make([]byte, 0, 44)
-	data = append(data, []byte(m.cfg.BRouteID)...)
-	data = append(data, []byte(m.cfg.BRoutePassword)...)
-	cctx, cancel := context.WithTimeout(ctx, m.cfg.CommandTimeout)
-	defer cancel()
-	_, err := m.drv.Request(cctx, bp35c2.CmdBRouteAuthSet, data)
-	return err
-}
-
-// activeScan sends an active-scan request and gathers per-channel
-// results delivered as 0x4051 notifications. Returns the first channel
-// that reported "found" (byte 0x00 in the notification payload).
-func (m *Manager) activeScan(ctx context.Context) (byte, error) {
-	// CmdActiveScan: [scanTime 1B][chMask 4B][idSet 1B=0x01][pairingID 8B]
-	pairing := []byte(m.cfg.BRouteID[len(m.cfg.BRouteID)-8:])
-	data := make([]byte, 0, 1+4+1+8)
-	data = append(data, m.cfg.ScanTimeExp)
-	data = binary.BigEndian.AppendUint32(data, m.cfg.ChannelMask)
-	data = append(data, 0x01)
-	data = append(data, pairing...)
-
-	// Response 0x2051 is the request acknowledgement; per-channel
-	// results come as 0x4051. Scan time upper bound = 14 channels *
-	// 9.64ms * 2^S. Add margin.
-	scanDur := time.Duration(14) * time.Duration(9.64e6*(1<<m.cfg.ScanTimeExp))
-	if scanDur < 5*time.Second {
-		scanDur = 5 * time.Second
-	}
-	scanDur += 3 * time.Second
-
-	cctx, cancel := context.WithTimeout(ctx, m.cfg.CommandTimeout)
-	defer cancel()
-	if _, err := m.drv.Request(cctx, bp35c2.CmdActiveScan, data); err != nil {
-		return 0, fmt.Errorf("CmdActiveScan: %w", err)
+	if err := m.simple(ctx, fmt.Sprintf("SKSREG S3 %04X", desc.PANID), m.cfg.CommandTimeout); err != nil {
+		return nil, fmt.Errorf("SKSREG S3: %w", err)
 	}
 
-	deadline := time.Now().Add(scanDur)
-	for time.Now().Before(deadline) {
-		nctx, ncancel := context.WithDeadline(ctx, deadline)
-		n, err := m.drv.WaitNotification(nctx, bp35c2.NotifyActiveScanCh)
-		ncancel()
-		if err != nil {
-			return 0, fmt.Errorf("waiting for scan result: %w", err)
-		}
-		ch, found, err := parseActiveScanResult(n.Data)
-		if err != nil {
-			m.log.Warn("bad active-scan notification", "err", err)
-			continue
-		}
-		if found {
-			return ch, nil
-		}
-	}
-	return 0, errors.New("no meter responded to active scan")
-}
-
-// parseActiveScanResult extracts the channel byte and match flag from
-// a 0x4051 notification. Layout (per UART spec §4):
-//
-//	[scanResult 1B][channel 1B][channelPage 1B]...
-//
-// scanResult: 0x00 = response received on this channel, 0x01 = no
-// response.
-func parseActiveScanResult(data []byte) (byte, bool, error) {
-	if len(data) < 2 {
-		return 0, false, fmt.Errorf("payload too short (%d)", len(data))
-	}
-	return data[1], data[0] == 0x00, nil
-}
-
-func (m *Manager) startBRoute(ctx context.Context, channel byte) (*Session, error) {
-	// CmdBRouteStart takes no request payload.
-	// Response 0x2053: [respResult 1B][channel 1B][panID 2B][macAddr 8B][rssi 1B]
-	cctx, cancel := context.WithTimeout(ctx, m.cfg.CommandTimeout)
-	defer cancel()
-	resp, err := m.drv.Request(cctx, bp35c2.CmdBRouteStart, nil)
+	ipv6, err := m.macToIPv6(ctx, desc.Addr)
 	if err != nil {
-		return nil, fmt.Errorf("CmdBRouteStart: %w", err)
+		return nil, fmt.Errorf("SKLL64: %w", err)
 	}
-	if len(resp.Data) < 1 {
-		return nil, fmt.Errorf("bad 0x2053 payload (len %d)", len(resp.Data))
-	}
-	if resp.Data[0] != 0x01 {
-		return nil, fmt.Errorf("CmdBRouteStart returned respResult=%#x", resp.Data[0])
-	}
-	if len(resp.Data) < 13 {
-		return nil, fmt.Errorf("bad 0x2053 payload (len %d)", len(resp.Data))
-	}
-	ch := resp.Data[1]
-	pan := binary.BigEndian.Uint16(resp.Data[2:4])
-	mac, err := ParseMac(resp.Data[4:12])
-	if err != nil {
+
+	m.setState(StateJoining)
+	if err := m.doJoin(ctx, ipv6); err != nil {
 		return nil, err
 	}
-	rssi := int8(resp.Data[12])
-	_ = channel // spec says 0x2053 always echoes ch; trust the response
+
 	return &Session{
-		MeterIP:  MacToLinkLocalIPv6(mac),
-		PANID:    pan,
-		Channel:  ch,
-		MeterMAC: mac,
-		RSSI:     rssi,
+		MeterIP:  ipv6,
+		PANID:    desc.PANID,
+		Channel:  desc.Channel,
+		MeterMAC: desc.Addr,
+		mgr:      m,
 	}, nil
 }
 
-func (m *Manager) openUDPPort(ctx context.Context) error {
-	data := []byte{0x0E, 0x1A} // 3610
-	cctx, cancel := context.WithTimeout(ctx, m.cfg.CommandTimeout)
+// simple runs a command that we expect to return OK with no meaningful
+// response body.
+func (m *Manager) simple(ctx context.Context, line string, timeout time.Duration) error {
+	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	_, err := m.drv.Request(cctx, bp35c2.CmdUDPPortOpen, data)
+	_, err := m.drv.Command(cctx, line)
 	return err
 }
 
-func (m *Manager) doPANA(ctx context.Context) error {
-	// Install PANA result channel so dispatchNotifications knows to
-	// forward the async result here instead of treating it as an
-	// auto-re-auth event.
-	panaCh := make(chan bp35c2.Notification, 1)
-	m.panaMu.Lock()
-	m.panaResultCh = panaCh
-	m.panaMu.Unlock()
+// EPANDescriptor is one scan result parsed out of an EPANDESC event.
+type EPANDescriptor struct {
+	Channel byte
+	PANID   uint16
+	Addr    string // 16 hex chars
+	LQI     byte
+	PairID  string
+}
+
+// activeScan runs SKSCAN and collects results until EVENT 22.
+//
+// dispatchEvents routes EPANDESC and EVENT 22 to scanResultCh while
+// we're subscribed, so we don't fight the dispatcher over events.
+func (m *Manager) activeScan(ctx context.Context) (EPANDescriptor, error) {
+	scanCh := make(chan bp35c2.Event, 16)
+	m.scanMu.Lock()
+	m.scanResultCh = scanCh
+	m.scanMu.Unlock()
 	defer func() {
-		m.panaMu.Lock()
-		m.panaResultCh = nil
-		m.panaMu.Unlock()
+		m.scanMu.Lock()
+		m.scanResultCh = nil
+		m.scanMu.Unlock()
 	}()
 
+	line := fmt.Sprintf("SKSCAN 2 %08X %d 0", m.cfg.ChannelMask, m.cfg.ScanDuration)
 	cctx, cancel := context.WithTimeout(ctx, m.cfg.CommandTimeout)
-	if _, err := m.drv.Request(cctx, bp35c2.CmdBRoutePANAStart, nil); err != nil {
+	if _, err := m.drv.Command(cctx, line); err != nil {
 		cancel()
-		return fmt.Errorf("CmdBRoutePANAStart: %w", err)
+		return EPANDescriptor{}, fmt.Errorf("SKSCAN: %w", err)
 	}
 	cancel()
 
-	waitCtx, waitCancel := context.WithTimeout(ctx, m.cfg.PANAAuthTimeout)
-	defer waitCancel()
+	// Overall wait: 14 channels × 9.6ms × 2^N + generous slack.
+	scanBudget := time.Duration(14) * (10 * time.Millisecond) * (1 << m.cfg.ScanDuration)
+	if scanBudget < 5*time.Second {
+		scanBudget = 5 * time.Second
+	}
+	scanBudget += 5 * time.Second
+
+	wctx, wcancel := context.WithTimeout(ctx, scanBudget)
+	defer wcancel()
+	var found *EPANDescriptor
+	for {
+		select {
+		case ev := <-scanCh:
+			switch ev.Kind {
+			case "EPANDESC":
+				desc, err := parseEPANDESC(ev)
+				if err != nil {
+					m.log.Warn("bad EPANDESC", "err", err)
+					continue
+				}
+				if found == nil || desc.LQI > found.LQI {
+					copy := desc
+					found = &copy
+				}
+			case "EVENT":
+				if len(ev.Params) >= 1 && ev.Params[0] == "22" {
+					if found != nil {
+						return *found, nil
+					}
+					return EPANDescriptor{}, errors.New("scan complete but no meter responded")
+				}
+			}
+		case <-wctx.Done():
+			if found != nil {
+				return *found, nil
+			}
+			return EPANDescriptor{}, errors.New("scan timed out with no beacon")
+		}
+	}
+}
+
+func parseEPANDESC(ev bp35c2.Event) (EPANDescriptor, error) {
+	if ev.Fields == nil {
+		return EPANDescriptor{}, errors.New("EPANDESC has no fields")
+	}
+	get := func(k string) string { return strings.TrimSpace(ev.Fields[k]) }
+
+	chS := get("Channel")
+	ch64, err := strconv.ParseUint(chS, 16, 8)
+	if err != nil {
+		return EPANDescriptor{}, fmt.Errorf("Channel %q: %w", chS, err)
+	}
+	panS := get("Pan ID")
+	pan64, err := strconv.ParseUint(panS, 16, 16)
+	if err != nil {
+		return EPANDescriptor{}, fmt.Errorf("Pan ID %q: %w", panS, err)
+	}
+	addr := get("Addr")
+	if len(addr) != 16 {
+		return EPANDescriptor{}, fmt.Errorf("Addr %q not 16 hex chars", addr)
+	}
+	if _, err := hex.DecodeString(addr); err != nil {
+		return EPANDescriptor{}, fmt.Errorf("Addr %q: %w", addr, err)
+	}
+	lqi := byte(0)
+	if s := get("LQI"); s != "" {
+		if v, err := strconv.ParseUint(s, 16, 8); err == nil {
+			lqi = byte(v)
+		}
+	}
+	return EPANDescriptor{
+		Channel: byte(ch64),
+		PANID:   uint16(pan64),
+		Addr:    addr,
+		LQI:     lqi,
+		PairID:  get("PairID"),
+	}, nil
+}
+
+// macToIPv6 asks the module to convert the neighbour's MAC to its
+// link-local IPv6 (with the U/L bit flip handled by firmware).
+//
+// SKLL64 response is one line containing the IPv6 in canonical form.
+func (m *Manager) macToIPv6(ctx context.Context, addr string) (net.IP, error) {
+	cctx, cancel := context.WithTimeout(ctx, m.cfg.CommandTimeout)
+	defer cancel()
+	resp, err := m.drv.Command(cctx, "SKLL64 "+addr)
+	if err != nil {
+		return nil, err
+	}
+	if len(resp) == 0 {
+		return nil, errors.New("SKLL64: empty response")
+	}
+	ip := net.ParseIP(strings.TrimSpace(resp[0]))
+	if ip == nil {
+		return nil, fmt.Errorf("SKLL64: bad IP %q", resp[0])
+	}
+	return ip, nil
+}
+
+// doJoin sends SKJOIN and waits for the async EVENT 25 (success) or
+// EVENT 24 (failure). SKJOIN itself returns OK immediately; the join
+// outcome is separate.
+func (m *Manager) doJoin(ctx context.Context, ip net.IP) error {
+	joinCh := make(chan bp35c2.Event, 1)
+	m.joinMu.Lock()
+	m.joinResultCh = joinCh
+	m.joinMu.Unlock()
+	defer func() {
+		m.joinMu.Lock()
+		m.joinResultCh = nil
+		m.joinMu.Unlock()
+	}()
+
+	cctx, cancel := context.WithTimeout(ctx, m.cfg.CommandTimeout)
+	if _, err := m.drv.Command(cctx, "SKJOIN "+ip.String()); err != nil {
+		cancel()
+		return fmt.Errorf("SKJOIN: %w", err)
+	}
+	cancel()
+
+	wctx, wcancel := context.WithTimeout(ctx, m.cfg.JoinTimeout)
+	defer wcancel()
 	select {
-	case n := <-panaCh:
-		if len(n.Data) < 1 {
-			return fmt.Errorf("bad PANA result notification (len %d)", len(n.Data))
+	case ev := <-joinCh:
+		if len(ev.Params) >= 1 && ev.Params[0] == "25" {
+			return nil
 		}
-		if n.Data[0] != 0x01 {
-			return fmt.Errorf("PANA authentication failed (result=%#x)", n.Data[0])
-		}
-		return nil
-	case <-waitCtx.Done():
-		return fmt.Errorf("PANA authentication timed out after %s", m.cfg.PANAAuthTimeout)
+		return fmt.Errorf("PANA authentication failed (EVENT %s)", ev.Params[0])
+	case <-wctx.Done():
+		return fmt.Errorf("PANA join timed out after %s", m.cfg.JoinTimeout)
 	}
 }

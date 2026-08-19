@@ -5,11 +5,12 @@
 # systemd EnvironmentFile= — never committed to this file.
 
 serial:
-  device: "${SERIAL_DEVICE}"
+  # SERIAL_DEVICE may be unset — falls back to /dev/ttyUSB0.
+  device: "${SERIAL_DEVICE:-/dev/ttyUSB0}"
   baud: 115200
 
 broute:
-  id: "${BROUTE_ID:/dev/ttyUSB0}"
+  id: "${BROUTE_ID}"
   password: "${BROUTE_PASSWORD}"
   # Where to persist the last-successful Wi-SUN channel so restarts
   # can skip the ~8s active scan.

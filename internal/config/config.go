@@ -173,13 +173,30 @@ func (c Config) Validate() error {
 	return nil
 }
 
-var envRE = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
+// envRE matches ${VAR} and ${VAR:-default}. The default part is any
+// run of characters that does not contain a closing brace — inline
+// paths, ports, and URLs work; embedded ${...} does not.
+var envRE = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}`)
 
-// expandEnv replaces ${VAR} tokens with their environment values.
-// Unset variables become the empty string.
+// expandEnv replaces ${VAR} and ${VAR:-default} tokens.
+//   - ${VAR}            → os.Getenv(VAR), empty if unset
+//   - ${VAR:-default}   → os.Getenv(VAR) if non-empty, else default
+//
+// The "empty falls back to default" semantic matches POSIX shell and
+// is what callers usually want (env vars that exist but are blank
+// almost always indicate a config mistake rather than intent).
 func expandEnv(s string) string {
 	return envRE.ReplaceAllStringFunc(s, func(m string) string {
-		name := m[2 : len(m)-1]
-		return os.Getenv(name)
+		// Use SubmatchIndex so we can distinguish "group 2 matched empty"
+		// from "group 2 did not match" — plain FindStringSubmatch returns
+		// "" for both.
+		idx := envRE.FindStringSubmatchIndex(m)
+		name := m[idx[2]:idx[3]]
+		v := os.Getenv(name)
+		hasDefault := idx[4] != -1
+		if v == "" && hasDefault {
+			return m[idx[4]:idx[5]]
+		}
+		return v
 	})
 }

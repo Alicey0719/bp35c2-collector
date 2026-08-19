@@ -26,13 +26,40 @@ BP35C2 USB Wi-SUNドングルを使って、Bルート経由でスマート電�
 
 ## ビルド
 
+普通のGoビルド:
+
 ```sh
 go build -o bp35c2-collector ./cmd/bp35c2-collector
 ```
 
+**glibc非依存の完全static binary** (どのLinuxディストロにも配れる):
+
+```sh
+CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o bp35c2-collector ./cmd/bp35c2-collector
+file bp35c2-collector   # → statically linked
+```
+
+**クロスコンパイル** (Raspberry Pi など):
+
+```sh
+# arm64 (Raspberry Pi 4/5 64-bit, Zero 2W)
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build ...
+
+# armv7 (Raspberry Pi 3+ 32-bit, Pi 2)
+CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build ...
+
+# armv6 (Raspberry Pi 1, Zero W)
+CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=6 go build ...
+```
+
+タグ (`v*`) を push すると **GitHub Actions が全アーキ用のtarball**
+(バイナリ + README + examples + systemd unit) を作成して Release に上げます。
+CI (`.github/workflows/ci.yml`) はpush/PRごとに `go vet` + `go test -race` + ネイティブbuild を通します。
+
 ## 設定
 
-[examples/config.yaml](examples/config.yaml) をコピーして編集。認証情報は環境変数で渡す (YAMLに平文で書かない):
+[examples/config.yaml](examples/config.yaml) をコピーして編集。認証情報は環境変数で渡す (YAMLに平文で書かない)。
+`${VAR}` は env参照、`${VAR:-default}` は env未設定/空のときのフォールバック:
 
 ```yaml
 broute:

@@ -28,6 +28,12 @@ import (
 	"github.com/Alicey0719/bp35c2-collector/internal/sink"
 )
 
+// Populated at link time via -ldflags "-X main.version=... -X main.commit=..."
+var (
+	version = "dev"
+	commit  = "none"
+)
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "fatal:", err)
@@ -36,9 +42,18 @@ func main() {
 }
 
 func run() error {
-	var cfgPath string
+	var (
+		cfgPath     string
+		showVersion bool
+	)
 	flag.StringVar(&cfgPath, "config", "/etc/bp35c2-collector/config.yaml", "path to config YAML")
+	flag.BoolVar(&showVersion, "version", false, "print version and exit")
 	flag.Parse()
+
+	if showVersion {
+		fmt.Printf("bp35c2-collector %s (commit %s)\n", version, commit)
+		return nil
+	}
 
 	cfg, err := config.Load(cfgPath)
 	if err != nil {

@@ -78,6 +78,31 @@ func TestValidate_MissingCredentials(t *testing.T) {
 	}
 }
 
+func TestExpandEnv_Defaults(t *testing.T) {
+	t.Setenv("SET_VAR", "actual")
+	t.Setenv("EMPTY_VAR", "")
+	// UNSET_VAR intentionally unset
+
+	cases := []struct {
+		in, want string
+	}{
+		{"${SET_VAR}", "actual"},
+		{"${UNSET_VAR}", ""},
+		{"${SET_VAR:-fallback}", "actual"},
+		{"${UNSET_VAR:-fallback}", "fallback"},
+		{"${EMPTY_VAR:-fallback}", "fallback"},          // POSIX-shell semantic
+		{"prefix-${UNSET_VAR:-/dev/ttyUSB0}-suffix", "prefix-/dev/ttyUSB0-suffix"},
+		{"${UNSET_VAR:-}", ""},                          // explicit empty default
+		{"no substitution here", "no substitution here"},
+		{"${SET_VAR} and ${UNSET_VAR:-nope}", "actual and nope"},
+	}
+	for _, c := range cases {
+		if got := expandEnv(c.in); got != c.want {
+			t.Errorf("expandEnv(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
 func TestValidate_InfluxDBRequiresURL(t *testing.T) {
 	c := Default()
 	c.BRoute.ID = "0123456789ABCDEF0123456789ABCDEF"

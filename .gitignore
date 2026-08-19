@@ -1,5 +1,9 @@
 /bp35c2-collector
 /build/
+/dist/
 *.test
 *.out
 .env
+
+# Vendor PDFs (ROHM copyright — not for redistribution)
+/doc/

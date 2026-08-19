@@ -14,7 +14,28 @@ permissions:
   contents: write # to publish releases
 
 jobs:
+  # test is a hard prerequisite for build. Keeping it inside the
+  # release workflow (rather than depending on the CI workflow via
+  # workflow_run) means one green pipeline gates the release, without
+  # fighting GitHub's separate-workflow scheduling.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+
+      - run: go mod download
+      - run: go vet ./...
+      - run: go test -race -timeout 60s ./...
+
   build:
+    needs: test
     name: build ${{ matrix.goos }}/${{ matrix.goarch }}${{ matrix.goarm && format('v{0}', matrix.goarm) || '' }}
     runs-on: ubuntu-latest
     strategy:
@@ -69,37 +90,47 @@ jobs:
           GOARM:  ${{ matrix.goarm }}
         run: |
           set -euo pipefail
-          out="dist/bp35c2-collector-${{ steps.meta.outputs.suffix }}"
           mkdir -p dist
+          # windows would want .exe; every target here is unix so plain.
+          bin="dist/bp35c2-collector-${{ steps.meta.outputs.version }}-${{ steps.meta.outputs.suffix }}"
           go build \
             -trimpath \
             -ldflags "-s -w -X main.version=${{ steps.meta.outputs.version }} -X main.commit=${{ steps.meta.outputs.commit }}" \
-            -o "${out}" \
+            -o "${bin}" \
             ./cmd/bp35c2-collector
-          ls -la "${out}"
-          file "${out}" || true
+          ls -la "${bin}"
+          file "${bin}" || true
+          # Bare-binary sha256 alongside the file.
+          ( cd dist && sha256sum "$(basename "${bin}")" > "$(basename "${bin}").sha256" )
 
       - name: Package tarball
         run: |
           set -euo pipefail
           suffix="${{ steps.meta.outputs.suffix }}"
           version="${{ steps.meta.outputs.version }}"
+          bin="dist/bp35c2-collector-${version}-${suffix}"
           stage="dist/pkg/bp35c2-collector-${version}-${suffix}"
           mkdir -p "${stage}"
-          cp "dist/bp35c2-collector-${suffix}" "${stage}/bp35c2-collector"
-          cp README.md LICENSE 2>/dev/null "${stage}/" || true
+          # Inside the tarball the binary is unadorned so `./bp35c2-collector` works.
+          cp "${bin}" "${stage}/bp35c2-collector"
+          cp README.md "${stage}/" 2>/dev/null || true
+          cp LICENSE "${stage}/"   2>/dev/null || true
           cp -r examples "${stage}/"
           cp -r systemd  "${stage}/"
           tar -C dist/pkg -czf "dist/bp35c2-collector-${version}-${suffix}.tar.gz" \
-            "$(basename ${stage})"
-          sha256sum "dist/bp35c2-collector-${version}-${suffix}.tar.gz" \
-            > "dist/bp35c2-collector-${version}-${suffix}.tar.gz.sha256"
+            "$(basename "${stage}")"
+          ( cd dist && sha256sum "bp35c2-collector-${version}-${suffix}.tar.gz" \
+              > "bp35c2-collector-${version}-${suffix}.tar.gz.sha256" )
+          rm -rf dist/pkg
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: bp35c2-collector-${{ steps.meta.outputs.suffix }}
+          # Ship both the raw binary and the tarball (plus sha256s).
           path: |
+            dist/bp35c2-collector-${{ steps.meta.outputs.version }}-${{ steps.meta.outputs.suffix }}
+            dist/bp35c2-collector-${{ steps.meta.outputs.version }}-${{ steps.meta.outputs.suffix }}.sha256
             dist/bp35c2-collector-${{ steps.meta.outputs.version }}-${{ steps.meta.outputs.suffix }}.tar.gz
             dist/bp35c2-collector-${{ steps.meta.outputs.version }}-${{ steps.meta.outputs.suffix }}.tar.gz.sha256
 
@@ -118,7 +149,8 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
+          # Everything the build job produced: bare binaries, tarballs,
+          # and their sha256 sidecars.
           files: |
-            dist/*.tar.gz
-            dist/*.sha256
+            dist/bp35c2-collector-*
           generate_release_notes: true

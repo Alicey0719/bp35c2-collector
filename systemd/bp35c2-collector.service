@@ -1,0 +1,43 @@
+[Unit]
+Description=BP35C2 Wi-SUN B-route smart meter collector
+Documentation=https://github.com/Alicey0719/bp35c2-collector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=bp35c2
+Group=bp35c2
+# Route-B credentials + Influx token live here, not in the YAML.
+EnvironmentFile=/etc/bp35c2-collector/env
+ExecStart=/usr/local/bin/bp35c2-collector --config /etc/bp35c2-collector/config.yaml
+Restart=always
+RestartSec=5s
+WatchdogSec=60s
+StandardOutput=journal
+StandardError=journal
+
+# Persistent state (last known Wi-SUN channel).
+StateDirectory=bp35c2-collector
+StateDirectoryMode=0750
+
+# Hardening.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+# The USB serial device is opened directly; nothing else on the fs
+# needs to be writable beyond StateDirectory.
+ReadWritePaths=/var/lib/bp35c2-collector
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,59 @@
+# bp35c2-collector configuration.
+#
+# Secrets (${BROUTE_ID}, ${BROUTE_PASSWORD}, ${INFLUX_TOKEN}) are
+# resolved from the process environment — typically supplied via
+# systemd EnvironmentFile= — never committed to this file.
+
+serial:
+  device: "${SERIAL_DEVICE}"
+  baud: 115200
+
+broute:
+  id: "${BROUTE_ID:/dev/ttyUSB0}"
+  password: "${BROUTE_PASSWORD}"
+  # Where to persist the last-successful Wi-SUN channel so restarts
+  # can skip the ~8s active scan.
+  state_dir: /var/lib/bp35c2-collector
+  # 6 → ~0.6s per channel × 14 channels ≈ 8.4s scan
+  scan_time_exp: 6
+  # 0x0003FFF0 = channels 4..17
+  channel_mask: 262128
+  pana_auth_timeout: 12m
+  command_timeout: 6s
+  initial_backoff: 5s
+  max_backoff: 5m
+
+poll:
+  instant_interval: 10s       # E7 (power) + E8 (current) + E9 (voltage)
+  cumulative_interval: 60s    # E0 + E3 + 88
+  scheduled_interval: 30m     # EA + EB
+  echonet_timeout: 5s
+
+sinks:
+  stdout:
+    enabled: true
+
+  influxdb:
+    enabled: false
+    url: http://influxdb:8086
+    token: "${INFLUX_TOKEN}"
+    org: home
+    bucket: smartmeter
+    measurement: smartmeter
+    batch_size: 50
+    flush_interval: 5s
+    # Downsample: aggregate samples into fixed windows before writing.
+    # Reduces stored points in InfluxDB without lowering the polling
+    # rate that stdout/Prometheus see. Counters (energy_*_kwh) are
+    # always aggregated as "last" regardless of `aggregation`.
+    # Leave window: 0 (or omit) to disable — every point is written.
+    downsample:
+      window: 0
+      aggregation: mean   # mean | max | min | last | sum
+
+  prometheus:
+    enabled: true
+    listen: ":9101"
+
+log:
+  level: info    # debug enables per-frame hex logging

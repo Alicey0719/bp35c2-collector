@@ -80,6 +80,26 @@ func run() error {
 	drv := bp35c2.New(port, log, 64)
 	defer drv.Close()
 
+	// 2a. Prime the module: hardware reset + wait for boot notification.
+	// Opening a USB-serial port can pulse DTR and reset the module,
+	// leaving the first command dropped mid-boot. Doing this ourselves
+	// gives a deterministic starting state and also serves as an early
+	// health check — a missing boot notice within the timeout means
+	// wrong device path, wrong baud, or a dead module, and surfacing
+	// that here beats confusing 6s response timeouts later.
+	primeCtx, primeCancel := context.WithTimeout(ctx, 15*time.Second)
+	if err := drv.SendRaw(bp35c2.CmdHardReset, nil); err != nil {
+		log.Warn("hardware reset send failed", "err", err)
+	}
+	if n, err := drv.WaitNotification(primeCtx, bp35c2.NotifyBoot); err != nil {
+		log.Warn("no boot notification received — module may already be running or the device path/baud/wiring is wrong",
+			"err", err,
+			"device", cfg.Serial.Device)
+	} else {
+		log.Info("BP35C2 module boot notification received", "payload_len", len(n.Data))
+	}
+	primeCancel()
+
 	// 3. Set up Prometheus sink first so we can register self-metrics
 	//    into its registry.
 	sinks := []sink.Sink{}

@@ -78,6 +78,27 @@ func TestValidate_MissingCredentials(t *testing.T) {
 	}
 }
 
+// TestLoad_ShippedExampleParses guards against the sort of YAML/type
+// mismatch that shipped in v0.1.1 (downsample.window: 0 tried to unmarshal
+// as time.Duration and failed at runtime). Loading examples/config.yaml
+// must succeed with placeholder credentials in the environment.
+func TestLoad_ShippedExampleParses(t *testing.T) {
+	t.Setenv("BROUTE_ID", "0123456789ABCDEF0123456789ABCDEF")
+	t.Setenv("BROUTE_PASSWORD", "PASSWORD1234")
+	t.Setenv("INFLUX_TOKEN", "placeholder")
+
+	c, err := Load("../../examples/config.yaml")
+	if err != nil {
+		t.Fatalf("Load examples/config.yaml: %v", err)
+	}
+	if c.Serial.Baud != 115200 {
+		t.Fatalf("baud: %d", c.Serial.Baud)
+	}
+	if c.Sinks.InfluxDB.Downsample.Window != 0 {
+		t.Fatalf("expected downsample.window to parse as zero, got %v", c.Sinks.InfluxDB.Downsample.Window)
+	}
+}
+
 func TestExpandEnv_Defaults(t *testing.T) {
 	t.Setenv("SET_VAR", "actual")
 	t.Setenv("EMPTY_VAR", "")

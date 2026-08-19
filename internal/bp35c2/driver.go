@@ -240,7 +240,10 @@ func (d *Driver) writeFrame(cmd uint16, data []byte) error {
 	if err != nil {
 		return err
 	}
-	d.log.Debug("bp35c2 tx", "cmd", fmt.Sprintf("%#04x", cmd), "len", len(data))
+	d.log.Debug("bp35c2 tx",
+		"cmd", fmt.Sprintf("%#04x", cmd),
+		"len", len(data),
+		"hex", fmt.Sprintf("%X", b))
 	_, err = d.rw.Write(b)
 	return err
 }
@@ -286,7 +289,10 @@ func (d *Driver) readLoop() {
 			d.log.Warn("bp35c2: dropped host-direction frame", "cmd", fmt.Sprintf("%#04x", f.Command))
 			continue
 		}
-		d.log.Debug("bp35c2 rx", "cmd", fmt.Sprintf("%#04x", f.Command), "len", len(f.Data))
+		d.log.Debug("bp35c2 rx",
+			"cmd", fmt.Sprintf("%#04x", f.Command),
+			"len", len(f.Data),
+			"hex", fmt.Sprintf("%X", f.Data))
 		if isResponse(f.Command) {
 			d.pendMu.Lock()
 			pr := d.pending

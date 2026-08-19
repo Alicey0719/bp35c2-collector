@@ -47,9 +47,9 @@ sinks:
     # Reduces stored points in InfluxDB without lowering the polling
     # rate that stdout/Prometheus see. Counters (energy_*_kwh) are
     # always aggregated as "last" regardless of `aggregation`.
-    # Leave window: 0 (or omit) to disable — every point is written.
+    # Omit the whole `downsample:` block (or set window: 0s) to disable.
     downsample:
-      window: 0
+      window: 0s          # e.g. 1m to aggregate into 1-minute windows
       aggregation: mean   # mean | max | min | last | sum
 
   prometheus:
